@@ -146,7 +146,10 @@ static const char *fourcc(unsigned int f, char *b) {
 }
 
 static void cmd_v4l2(const char *dev) {
-    int fd = open(dev, O_RDWR);
+    // O_NONBLOCK обязателен: с блокирующим дескриптором VIDIOC_DQBUF виснет
+    // в ядре (vb2_core_dqbuf) навсегда, если кадры перестали приходить, и
+    // цикл повторов по EAGAIN не срабатывает вообще.
+    int fd = open(dev, O_RDWR | O_NONBLOCK);
     if (fd < 0) { printf("не открыть %s: %s\n", dev, strerror(errno)); return; }
 
     struct v4l2_capability cap;
@@ -198,7 +201,10 @@ static void cmd_v4l2(const char *dev) {
 // и показываем разброс, а на диск кладём самый большой.
 static int capture(const char *dev, const char *out, unsigned int want_fmt,
                    int want_w, int want_h, int frames_wanted, int quiet) {
-    int fd = open(dev, O_RDWR);
+    // O_NONBLOCK обязателен: с блокирующим дескриптором VIDIOC_DQBUF виснет
+    // в ядре (vb2_core_dqbuf) навсегда, если кадры перестали приходить, и
+    // цикл повторов по EAGAIN не срабатывает вообще.
+    int fd = open(dev, O_RDWR | O_NONBLOCK);
     if (fd < 0) { printf("не открыть %s: %s\n", dev, strerror(errno)); return -1; }
 
     // Резкость ставится этим же дескриптором. Отдельный вызов открывал бы
@@ -293,7 +299,10 @@ static void cmd_grab(const char *dev, const char *out, unsigned int fmt, int w, 
 
 /** Прогон всех заявленных режимов: что из них реально отдаёт кадры и какого веса. */
 static void cmd_modes(const char *dev) {
-    int fd = open(dev, O_RDWR);
+    // O_NONBLOCK обязателен: с блокирующим дескриптором VIDIOC_DQBUF виснет
+    // в ядре (vb2_core_dqbuf) навсегда, если кадры перестали приходить, и
+    // цикл повторов по EAGAIN не срабатывает вообще.
+    int fd = open(dev, O_RDWR | O_NONBLOCK);
     if (fd < 0) { printf("не открыть %s: %s\n", dev, strerror(errno)); return; }
     struct { unsigned int fmt; int w, h; } list[32];
     int n = 0;
@@ -386,7 +395,10 @@ static void cmd_sendhid(const char *dev, const char *hex) {
 
 /** Регуляторы камеры: яркость, экспозиция, качество сжатия — что вообще доступно. */
 static void cmd_ctrls(const char *dev) {
-    int fd = open(dev, O_RDWR);
+    // O_NONBLOCK обязателен: с блокирующим дескриптором VIDIOC_DQBUF виснет
+    // в ядре (vb2_core_dqbuf) навсегда, если кадры перестали приходить, и
+    // цикл повторов по EAGAIN не срабатывает вообще.
+    int fd = open(dev, O_RDWR | O_NONBLOCK);
     if (fd < 0) { printf("не открыть %s: %s\n", dev, strerror(errno)); return; }
     printf("=== регуляторы %s ===\n", dev);
     int found = 0;
@@ -445,7 +457,10 @@ static void cmd_setctrl(const char *dev, unsigned int id, int value) {
  * больше — прямого показателя резкости камера не отдаёт.
  */
 static void cmd_focus(const char *dev) {
-    int fd = open(dev, O_RDWR);
+    // O_NONBLOCK обязателен: с блокирующим дескриптором VIDIOC_DQBUF виснет
+    // в ядре (vb2_core_dqbuf) навсегда, если кадры перестали приходить, и
+    // цикл повторов по EAGAIN не срабатывает вообще.
+    int fd = open(dev, O_RDWR | O_NONBLOCK);
     if (fd < 0) { printf("не открыть %s: %s\n", dev, strerror(errno)); return; }
 
     struct v4l2_format f;
@@ -611,7 +626,10 @@ static void cmd_cmd(const char *dev, unsigned int code, const char *hexdata) {
  */
 static void cmd_record(const char *dev, const char *out, int seconds,
                        unsigned int fmt, int w, int h) {
-    int fd = open(dev, O_RDWR);
+    // O_NONBLOCK обязателен: с блокирующим дескриптором VIDIOC_DQBUF виснет
+    // в ядре (vb2_core_dqbuf) навсегда, если кадры перестали приходить, и
+    // цикл повторов по EAGAIN не срабатывает вообще.
+    int fd = open(dev, O_RDWR | O_NONBLOCK);
     if (fd < 0) { printf("не открыть %s: %s\n", dev, strerror(errno)); return; }
 
     set_ctrl(fd, 0x0098091b, 100);
