@@ -508,6 +508,89 @@ static void cmd_focus(const char *dev) {
     close(fd);
 }
 
+
+/* ── Протокол XREAL ──────────────────────────────────────────────────────────
+ *
+ * Кадр: fd | CRC32-LE(тело) | тело
+ * тело: длина(2,LE) | 8 нулей | код(1) | 6 нулей | данные
+ *
+ * Контрольная сумма — обычный CRC32 (полином 0xEDB88320, начальное значение
+ * 0xFFFFFFFF, финальная инверсия), считается от начала тела до конца кадра.
+ * Подобрана по перехваченным командам: совпала на всех образцах.
+ */
+static unsigned int crc32_calc(const unsigned char *p, int n) {
+    unsigned int c = 0xFFFFFFFFu;
+    for (int i = 0; i < n; i++) {
+        c ^= p[i];
+        for (int k = 0; k < 8; k++)
+            c = (c >> 1) ^ (0xEDB88320u & (unsigned int)(-(int)(c & 1)));
+    }
+    return ~c;
+}
+
+static int build_cmd(unsigned char *out, int cap, unsigned char code,
+                     const unsigned char *data, int dlen) {
+    int body = 2 + 8 + 1 + 6 + dlen;      // длина + нули + код + нули + данные
+    int total = 5 + body;
+    if (total > cap) return -1;
+    memset(out, 0, total);
+    out[0] = 0xfd;
+    out[5] = (unsigned char)(body & 0xff);
+    out[6] = (unsigned char)((body >> 8) & 0xff);
+    out[15] = code;
+    if (dlen > 0) memcpy(out + 22, data, dlen);
+    unsigned int c = crc32_calc(out + 5, body);
+    out[1] = (unsigned char)(c & 0xff);
+    out[2] = (unsigned char)((c >> 8) & 0xff);
+    out[3] = (unsigned char)((c >> 16) & 0xff);
+    out[4] = (unsigned char)((c >> 24) & 0xff);
+    return total;
+}
+
+/** Собрать команду по коду и данным, отправить, показать ответ. */
+static void cmd_cmd(const char *dev, unsigned int code, const char *hexdata) {
+    unsigned char data[64]; int dlen = 0;
+    if (hexdata) {
+        for (const char *p = hexdata; *p && dlen < (int)sizeof data; ) {
+            if (*p == ' ' || *p == ':') { p++; continue; }
+            unsigned int v;
+            if (sscanf(p, "%2x", &v) != 1) break;
+            data[dlen++] = (unsigned char)v;
+            p += 2;
+        }
+    }
+    unsigned char frame[256];
+    int n = build_cmd(frame, sizeof frame, (unsigned char)code, data, dlen);
+    if (n < 0) { printf("команда не собралась\n"); return; }
+    printf("код 0x%02x, данных %d байт → кадр %d байт:\n  ", code, dlen, n);
+    for (int i = 0; i < n; i++) printf("%02x ", frame[i]);
+    printf("\n");
+
+    int fd = open(dev, O_RDWR | O_NONBLOCK);
+    if (fd < 0) { printf("не открыть %s: %s\n", dev, strerror(errno)); return; }
+    if (write(fd, frame, n) < 0) { printf("запись: %s\n", strerror(errno)); close(fd); return; }
+    unsigned char in[1024];
+    for (int a = 0; a < 40; a++) {
+        ssize_t r = read(fd, in, sizeof in);
+        if (r > 0) {
+            printf("ответ %zd байт:\n  ", r);
+            for (int i = 0; i < r && i < 40; i++) printf("%02x ", in[i]);
+            printf("\n");
+            // Полезная часть ответа начинается там же, где данные в запросе.
+            if (r > 22) {
+                printf("  данные ответа: ");
+                for (int i = 22; i < r && i < 42; i++) printf("%02x ", in[i]);
+                printf("\n");
+            }
+            close(fd); return;
+        }
+        if (errno != EAGAIN && errno != EWOULDBLOCK) break;
+        usleep(50000);
+    }
+    printf("ответа нет\n");
+    close(fd);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         printf("использование:\n"
@@ -520,7 +603,8 @@ int main(int argc, char **argv) {
                "  xrprobe --sendhid <hidraw> <hex-байты>\n"
                "  xrprobe --ctrls <устройство>\n"
                "  xrprobe --setctrl <устройство> <id 0x..> <значение>\n"
-               "  xrprobe --focus <устройство>\n");
+               "  xrprobe --focus <устройство>\n"
+               "  xrprobe --cmd <hidraw> <код 0x..> [hex-данные]\n");
         return 1;
     }
     if (!strcmp(argv[1], "--info")) cmd_info();
@@ -543,6 +627,8 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[1], "--setctrl") && argc > 4)
         cmd_setctrl(argv[2], (unsigned int)strtoul(argv[3], NULL, 0), atoi(argv[4]));
     else if (!strcmp(argv[1], "--focus") && argc > 2) cmd_focus(argv[2]);
+    else if (!strcmp(argv[1], "--cmd") && argc > 3)
+        cmd_cmd(argv[2], (unsigned int)strtoul(argv[3], NULL, 0), argc > 4 ? argv[4] : NULL);
     else { printf("неизвестная команда\n"); return 1; }
     return 0;
 }
