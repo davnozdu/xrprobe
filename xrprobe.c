@@ -421,30 +421,86 @@ static void cmd_setctrl(const char *dev, unsigned int id, int value) {
 }
 
 /**
- * Подбор фокуса по объёму кадра.
+ * Подбор фокуса по объёму кадра — в одной сессии потока.
  *
- * Резкий кадр содержит больше высокочастотных деталей, поэтому JPEG от него
- * весит больше. Прямого показателя резкости камера не отдаёт, а размер
- * кадра доступен всегда и меняется монотонно вокруг точки фокуса.
+ * Открывать устройство на каждое положение нельзя: закрытие сбрасывает
+ * взведение потока, и следующий S_FMT падает с EIO. Поэтому поток
+ * запускается один раз, а фокус переставляется на ходу.
+ *
+ * Резкий кадр содержит больше высокочастотных деталей и потому весит
+ * больше — прямого показателя резкости камера не отдаёт.
  */
 static void cmd_focus(const char *dev) {
-    printf("=== подбор фокуса по объёму кадра ===\n");
-    printf("(больше байт = больше деталей = резче)\n\n");
-    for (int f = 200; f <= 800; f += 100) {
-        int fd = open(dev, O_RDWR);
-        if (fd < 0) { printf("не открыть: %s\n", strerror(errno)); return; }
-        if (set_ctrl(fd, 0x009a090a, f) != 0) {
-            printf("  фокус %3d: не установить (%s)\n", f, strerror(errno));
-            close(fd); continue;
-        }
-        close(fd);
-        usleep(600000);  // объектив едет не мгновенно
-        printf("  фокус %3d: ", f);
-        fflush(stdout);
-        char path[128];
-        snprintf(path, sizeof path, "/data/local/tmp/focus_%d.jpg", f);
-        capture(dev, path, V4L2_PIX_FMT_MJPEG, 1920, 1080, 12, 1);
+    int fd = open(dev, O_RDWR);
+    if (fd < 0) { printf("не открыть %s: %s\n", dev, strerror(errno)); return; }
+
+    struct v4l2_format f;
+    memset(&f, 0, sizeof f);
+    f.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    f.fmt.pix.width = 1920; f.fmt.pix.height = 1080;
+    f.fmt.pix.pixelformat = V4L2_PIX_FMT_MJPEG;
+    f.fmt.pix.field = V4L2_FIELD_NONE;
+    if (ioctl(fd, VIDIOC_S_FMT, &f) != 0) {
+        printf("S_FMT: %s\n  (поток не взведён — пошлите команду активации 0xd3)\n", strerror(errno));
+        close(fd); return;
     }
+
+    struct v4l2_requestbuffers rb;
+    memset(&rb, 0, sizeof rb);
+    rb.count = 6; rb.type = V4L2_BUF_TYPE_VIDEO_CAPTURE; rb.memory = V4L2_MEMORY_MMAP;
+    if (ioctl(fd, VIDIOC_REQBUFS, &rb) != 0) { printf("REQBUFS: %s\n", strerror(errno)); close(fd); return; }
+
+    void *bufs[8]; unsigned int lens[8];
+    for (unsigned i = 0; i < rb.count && i < 8; i++) {
+        struct v4l2_buffer bf;
+        memset(&bf, 0, sizeof bf);
+        bf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE; bf.memory = V4L2_MEMORY_MMAP; bf.index = i;
+        if (ioctl(fd, VIDIOC_QUERYBUF, &bf) != 0) { close(fd); return; }
+        bufs[i] = mmap(NULL, bf.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, bf.m.offset);
+        lens[i] = bf.length;
+        if (bufs[i] == MAP_FAILED) { close(fd); return; }
+        ioctl(fd, VIDIOC_QBUF, &bf);
+    }
+    int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (ioctl(fd, VIDIOC_STREAMON, &type) != 0) { printf("STREAMON: %s\n", strerror(errno)); close(fd); return; }
+
+    printf("=== подбор фокуса (больше байт = резче) ===\n");
+    int best_f = 0; unsigned int best_sz = 0;
+    for (int fv = 200; fv <= 800; fv += 50) {
+        set_ctrl(fd, 0x009a090a, fv);
+
+        // Первые кадры после перестановки ещё сняты старым фокусом —
+        // объектив едет, поэтому их отбрасываем.
+        unsigned int mx = 0;
+        for (int k = 0; k < 22; k++) {
+            struct v4l2_buffer bf;
+            memset(&bf, 0, sizeof bf);
+            bf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE; bf.memory = V4L2_MEMORY_MMAP;
+            int ok = -1;
+            for (int a = 0; a < 40; a++) {
+                if (ioctl(fd, VIDIOC_DQBUF, &bf) == 0) { ok = 0; break; }
+                if (errno != EAGAIN) break;
+                usleep(20000);
+            }
+            if (ok != 0) break;
+            if (k >= 12 && bf.bytesused > mx) {
+                mx = bf.bytesused;
+                char path[128];
+                snprintf(path, sizeof path, "/data/local/tmp/focus_%d.jpg", fv);
+                FILE *o = fopen(path, "wb");
+                if (o) { fwrite(bufs[bf.index], 1, bf.bytesused, o); fclose(o); }
+            }
+            ioctl(fd, VIDIOC_QBUF, &bf);
+        }
+        printf("  фокус %3d: %6u байт%s\n", fv, mx, mx > best_sz ? "   <-- лучший" : "");
+        if (mx > best_sz) { best_sz = mx; best_f = fv; }
+    }
+    printf("\nЛУЧШИЙ ФОКУС: %d (%u байт), снимок в /data/local/tmp/focus_%d.jpg\n", best_f, best_sz, best_f);
+    set_ctrl(fd, 0x009a090a, best_f);
+
+    ioctl(fd, VIDIOC_STREAMOFF, &type);
+    for (unsigned i = 0; i < rb.count && i < 8; i++) munmap(bufs[i], lens[i]);
+    close(fd);
 }
 
 int main(int argc, char **argv) {
