@@ -369,6 +369,35 @@ static void cmd_sendhid(const char *dev, const char *hex) {
     close(fd);
 }
 
+
+/** Регуляторы камеры: яркость, экспозиция, качество сжатия — что вообще доступно. */
+static void cmd_ctrls(const char *dev) {
+    int fd = open(dev, O_RDWR);
+    if (fd < 0) { printf("не открыть %s: %s\n", dev, strerror(errno)); return; }
+    printf("=== регуляторы %s ===\n", dev);
+    int found = 0;
+    struct v4l2_queryctrl q;
+    memset(&q, 0, sizeof q);
+    // V4L2_CTRL_FLAG_NEXT_CTRL обходит все, включая расширенные классы.
+    q.id = V4L2_CTRL_FLAG_NEXT_CTRL;
+    while (ioctl(fd, VIDIOC_QUERYCTRL, &q) == 0) {
+        if (!(q.flags & V4L2_CTRL_FLAG_DISABLED)) {
+            struct v4l2_control c;
+            memset(&c, 0, sizeof c);
+            c.id = q.id;
+            int have = (ioctl(fd, VIDIOC_G_CTRL, &c) == 0);
+            printf("  0x%08x %-34s мин=%d макс=%d шаг=%d умолч=%d", q.id, q.name,
+                   q.minimum, q.maximum, q.step, q.default_value);
+            if (have) printf("  ТЕКУЩЕЕ=%d", c.value);
+            printf("\n");
+            found++;
+        }
+        q.id |= V4L2_CTRL_FLAG_NEXT_CTRL;
+    }
+    if (!found) printf("  регуляторов нет — камера ничего не отдаёт на настройку\n");
+    close(fd);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         printf("использование:\n"
@@ -378,7 +407,8 @@ int main(int argc, char **argv) {
                "  xrprobe --v4l2 <устройство>\n"
                "  xrprobe --grab <устройство> <файл> [MJPG|HEVC] [ШxВ]\n"
                "  xrprobe --modes <устройство>\n"
-               "  xrprobe --sendhid <hidraw> <hex-байты>\n");
+               "  xrprobe --sendhid <hidraw> <hex-байты>\n"
+               "  xrprobe --ctrls <устройство>\n");
         return 1;
     }
     if (!strcmp(argv[1], "--info")) cmd_info();
@@ -397,6 +427,7 @@ int main(int argc, char **argv) {
     }
     else if (!strcmp(argv[1], "--modes") && argc > 2) cmd_modes(argv[2]);
     else if (!strcmp(argv[1], "--sendhid") && argc > 3) cmd_sendhid(argv[2], argv[3]);
+    else if (!strcmp(argv[1], "--ctrls") && argc > 2) cmd_ctrls(argv[2]);
     else { printf("неизвестная команда\n"); return 1; }
     return 0;
 }
