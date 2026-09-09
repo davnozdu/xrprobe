@@ -189,82 +189,132 @@ static void cmd_v4l2(const char *dev) {
     close(fd);
 }
 
-// Захват одного кадра через mmap. Пишет сырые байты в файл.
-static void cmd_grab(const char *dev, const char *out, int want_mjpeg) {
+// Захват серии кадров. Первые кадры после старта потока часто пустые или
+// сильно сжатые — по одному судить о качестве нельзя, поэтому берём серию
+// и показываем разброс, а на диск кладём самый большой.
+static int capture(const char *dev, const char *out, unsigned int want_fmt,
+                   int want_w, int want_h, int frames_wanted, int quiet) {
     int fd = open(dev, O_RDWR);
-    if (fd < 0) { printf("не открыть %s: %s\n", dev, strerror(errno)); return; }
+    if (fd < 0) { printf("не открыть %s: %s\n", dev, strerror(errno)); return -1; }
 
     struct v4l2_format f;
     memset(&f, 0, sizeof f);
     f.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    if (want_mjpeg) {
-        f.fmt.pix.width = 1920;
-        f.fmt.pix.height = 1080;
-        f.fmt.pix.pixelformat = V4L2_PIX_FMT_MJPEG;
+    if (want_fmt) {
+        f.fmt.pix.width = want_w;
+        f.fmt.pix.height = want_h;
+        f.fmt.pix.pixelformat = want_fmt;
         f.fmt.pix.field = V4L2_FIELD_NONE;
-        if (ioctl(fd, VIDIOC_S_FMT, &f) != 0) printf("S_FMT MJPEG не удался: %s\n", strerror(errno));
-        else printf("формат переключён на MJPEG\n");
+        if (ioctl(fd, VIDIOC_S_FMT, &f) != 0) {
+            if (!quiet) printf("  S_FMT не удался: %s\n", strerror(errno));
+            close(fd); return -1;
+        }
     }
-    if (ioctl(fd, VIDIOC_G_FMT, &f) != 0) { printf("G_FMT: %s\n", strerror(errno)); close(fd); return; }
+    if (ioctl(fd, VIDIOC_G_FMT, &f) != 0) { close(fd); return -1; }
+
     char b[5];
-    printf("текущий формат: %ux%u %s, кадр %u байт\n", f.fmt.pix.width, f.fmt.pix.height,
-           fourcc(f.fmt.pix.pixelformat, b), f.fmt.pix.sizeimage);
+    // Драйвер вправе выдать не то, что просили — показываем, что реально встало.
+    printf("  режим: %ux%u %s\n", f.fmt.pix.width, f.fmt.pix.height,
+           fourcc(f.fmt.pix.pixelformat, b));
 
     struct v4l2_requestbuffers rb;
     memset(&rb, 0, sizeof rb);
-    rb.count = 4; rb.type = V4L2_BUF_TYPE_VIDEO_CAPTURE; rb.memory = V4L2_MEMORY_MMAP;
-    if (ioctl(fd, VIDIOC_REQBUFS, &rb) != 0) { printf("REQBUFS: %s\n", strerror(errno)); close(fd); return; }
-    printf("буферов выделено: %u\n", rb.count);
+    rb.count = 6; rb.type = V4L2_BUF_TYPE_VIDEO_CAPTURE; rb.memory = V4L2_MEMORY_MMAP;
+    if (ioctl(fd, VIDIOC_REQBUFS, &rb) != 0) { printf("  REQBUFS: %s\n", strerror(errno)); close(fd); return -1; }
 
     void *bufs[8]; unsigned int lens[8];
     for (unsigned i = 0; i < rb.count && i < 8; i++) {
         struct v4l2_buffer bf;
         memset(&bf, 0, sizeof bf);
         bf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE; bf.memory = V4L2_MEMORY_MMAP; bf.index = i;
-        if (ioctl(fd, VIDIOC_QUERYBUF, &bf) != 0) { printf("QUERYBUF: %s\n", strerror(errno)); close(fd); return; }
+        if (ioctl(fd, VIDIOC_QUERYBUF, &bf) != 0) { close(fd); return -1; }
         bufs[i] = mmap(NULL, bf.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, bf.m.offset);
         lens[i] = bf.length;
-        if (bufs[i] == MAP_FAILED) { printf("mmap: %s\n", strerror(errno)); close(fd); return; }
-        if (ioctl(fd, VIDIOC_QBUF, &bf) != 0) { printf("QBUF: %s\n", strerror(errno)); close(fd); return; }
+        if (bufs[i] == MAP_FAILED) { close(fd); return -1; }
+        if (ioctl(fd, VIDIOC_QBUF, &bf) != 0) { close(fd); return -1; }
     }
 
     int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    if (ioctl(fd, VIDIOC_STREAMON, &type) != 0) { printf("STREAMON: %s\n", strerror(errno)); close(fd); return; }
-    printf("поток запущен, ждём кадр...\n");
+    if (ioctl(fd, VIDIOC_STREAMON, &type) != 0) {
+        printf("  STREAMON: %s\n", strerror(errno));
+        for (unsigned i = 0; i < rb.count && i < 8; i++) munmap(bufs[i], lens[i]);
+        close(fd); return -1;
+    }
 
-    struct v4l2_buffer bf;
-    int saved = 0;
-    for (int frame = 0; frame < 40 && !saved; frame++) {
+    unsigned int best = 0, total = 0, count = 0, minsz = 0xffffffff, maxsz = 0;
+    for (int frame = 0; frame < frames_wanted; frame++) {
+        struct v4l2_buffer bf;
         memset(&bf, 0, sizeof bf);
         bf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE; bf.memory = V4L2_MEMORY_MMAP;
         int ok = -1;
-        for (int a = 0; a < 40; a++) {
+        for (int a = 0; a < 60; a++) {
             if (ioctl(fd, VIDIOC_DQBUF, &bf) == 0) { ok = 0; break; }
-            if (errno != EAGAIN) { printf("DQBUF: %s\n", strerror(errno)); break; }
-            usleep(25000);
+            if (errno != EAGAIN) break;
+            usleep(20000);
         }
         if (ok != 0) break;
-        const unsigned char *p = bufs[bf.index];
-        printf("  кадр %2d: %7u байт", frame, bf.bytesused);
-        if (bf.bytesused >= 4) printf("  начало: %02x %02x %02x %02x", p[0], p[1], p[2], p[3]);
-        printf("\n");
         if (bf.bytesused > 2000) {
-            FILE *o = fopen(out, "wb");
-            if (o) {
-                fwrite(p, 1, bf.bytesused, o);
-                fclose(o);
-                printf("СОДЕРЖАТЕЛЬНЫЙ КАДР записан в %s (%u байт)\n", out, bf.bytesused);
-                if (p[0] == 0xff && p[1] == 0xd8) printf("это корректный JPEG (маркер SOI ff d8)\n");
-                saved = 1;
+            count++; total += bf.bytesused;
+            if (bf.bytesused < minsz) minsz = bf.bytesused;
+            if (bf.bytesused > maxsz) maxsz = bf.bytesused;
+            if (bf.bytesused > best && out) {
+                best = bf.bytesused;
+                FILE *o = fopen(out, "wb");
+                if (o) { fwrite(bufs[bf.index], 1, bf.bytesused, o); fclose(o); }
             }
         }
         ioctl(fd, VIDIOC_QBUF, &bf);
     }
-    if (!saved) printf("содержательных кадров не получено\n");
+
+    if (count)
+        printf("  кадров: %u   мин %u   средн %u   МАКС %u байт\n",
+               count, minsz, total / count, maxsz);
+    else
+        printf("  содержательных кадров нет\n");
 
     ioctl(fd, VIDIOC_STREAMOFF, &type);
     for (unsigned i = 0; i < rb.count && i < 8; i++) munmap(bufs[i], lens[i]);
     close(fd);
+    return count ? 0 : -1;
+}
+
+static void cmd_grab(const char *dev, const char *out, unsigned int fmt, int w, int h) {
+    capture(dev, out, fmt, w, h, 40, 0);
+}
+
+/** Прогон всех заявленных режимов: что из них реально отдаёт кадры и какого веса. */
+static void cmd_modes(const char *dev) {
+    int fd = open(dev, O_RDWR);
+    if (fd < 0) { printf("не открыть %s: %s\n", dev, strerror(errno)); return; }
+    struct { unsigned int fmt; int w, h; } list[32];
+    int n = 0;
+    for (int i = 0; i < 8 && n < 32; i++) {
+        struct v4l2_fmtdesc fd_;
+        memset(&fd_, 0, sizeof fd_);
+        fd_.index = i; fd_.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        if (ioctl(fd, VIDIOC_ENUM_FMT, &fd_) != 0) break;
+        for (int j = 0; j < 12 && n < 32; j++) {
+            struct v4l2_frmsizeenum fs;
+            memset(&fs, 0, sizeof fs);
+            fs.index = j; fs.pixel_format = fd_.pixelformat;
+            if (ioctl(fd, VIDIOC_ENUM_FRAMESIZES, &fs) != 0) break;
+            if (fs.type != V4L2_FRMSIZE_TYPE_DISCRETE) break;
+            list[n].fmt = fd_.pixelformat;
+            list[n].w = fs.discrete.width;
+            list[n].h = fs.discrete.height;
+            n++;
+        }
+    }
+    close(fd);
+
+    char b[5];
+    for (int i = 0; i < n; i++) {
+        printf("\n=== %s %dx%d ===\n", fourcc(list[i].fmt, b), list[i].w, list[i].h);
+        char path[128];
+        snprintf(path, sizeof path, "/data/local/tmp/mode_%s_%dx%d.bin",
+                 fourcc(list[i].fmt, b), list[i].w, list[i].h);
+        capture(dev, path, list[i].fmt, list[i].w, list[i].h, 25, 1);
+    }
 }
 
 int main(int argc, char **argv) {
@@ -274,14 +324,25 @@ int main(int argc, char **argv) {
                "  xrprobe --syms <путь к .so>\n"
                "  xrprobe --call <путь к .so>\n"
                "  xrprobe --v4l2 <устройство>\n"
-               "  xrprobe --grab <устройство> <файл> [mjpeg]\n");
+               "  xrprobe --grab <устройство> <файл> [MJPG|HEVC] [ШxВ]\n"
+               "  xrprobe --modes <устройство>\n");
         return 1;
     }
     if (!strcmp(argv[1], "--info")) cmd_info();
     else if (!strcmp(argv[1], "--syms") && argc > 2) cmd_syms(argv[2]);
     else if (!strcmp(argv[1], "--call") && argc > 2) cmd_call(argv[2]);
     else if (!strcmp(argv[1], "--v4l2") && argc > 2) cmd_v4l2(argv[2]);
-    else if (!strcmp(argv[1], "--grab") && argc > 3) cmd_grab(argv[2], argv[3], argc > 4);
+    else if (!strcmp(argv[1], "--grab") && argc > 3) {
+        unsigned int fmt = 0; int w = 0, h = 0;
+        if (argc > 4) {
+            if (!strcasecmp(argv[4], "mjpg") || !strcasecmp(argv[4], "mjpeg")) fmt = V4L2_PIX_FMT_MJPEG;
+            else if (!strcasecmp(argv[4], "hevc")) fmt = v4l2_fourcc('H','E','V','C');
+            w = 1920; h = 1080;
+        }
+        if (argc > 5) sscanf(argv[5], "%dx%d", &w, &h);
+        cmd_grab(argv[2], argv[3], fmt, w, h);
+    }
+    else if (!strcmp(argv[1], "--modes") && argc > 2) cmd_modes(argv[2]);
     else { printf("неизвестная команда\n"); return 1; }
     return 0;
 }
