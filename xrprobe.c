@@ -398,6 +398,55 @@ static void cmd_ctrls(const char *dev) {
     close(fd);
 }
 
+
+static int set_ctrl(int fd, unsigned int id, int value) {
+    struct v4l2_control c;
+    memset(&c, 0, sizeof c);
+    c.id = id; c.value = value;
+    return ioctl(fd, VIDIOC_S_CTRL, &c);
+}
+
+static void cmd_setctrl(const char *dev, unsigned int id, int value) {
+    int fd = open(dev, O_RDWR);
+    if (fd < 0) { printf("не открыть: %s\n", strerror(errno)); return; }
+    if (set_ctrl(fd, id, value) != 0) printf("не удалось: %s\n", strerror(errno));
+    else {
+        struct v4l2_control c;
+        memset(&c, 0, sizeof c);
+        c.id = id;
+        ioctl(fd, VIDIOC_G_CTRL, &c);
+        printf("0x%08x = %d (запрошено %d)\n", id, c.value, value);
+    }
+    close(fd);
+}
+
+/**
+ * Подбор фокуса по объёму кадра.
+ *
+ * Резкий кадр содержит больше высокочастотных деталей, поэтому JPEG от него
+ * весит больше. Прямого показателя резкости камера не отдаёт, а размер
+ * кадра доступен всегда и меняется монотонно вокруг точки фокуса.
+ */
+static void cmd_focus(const char *dev) {
+    printf("=== подбор фокуса по объёму кадра ===\n");
+    printf("(больше байт = больше деталей = резче)\n\n");
+    for (int f = 200; f <= 800; f += 100) {
+        int fd = open(dev, O_RDWR);
+        if (fd < 0) { printf("не открыть: %s\n", strerror(errno)); return; }
+        if (set_ctrl(fd, 0x009a090a, f) != 0) {
+            printf("  фокус %3d: не установить (%s)\n", f, strerror(errno));
+            close(fd); continue;
+        }
+        close(fd);
+        usleep(600000);  // объектив едет не мгновенно
+        printf("  фокус %3d: ", f);
+        fflush(stdout);
+        char path[128];
+        snprintf(path, sizeof path, "/data/local/tmp/focus_%d.jpg", f);
+        capture(dev, path, V4L2_PIX_FMT_MJPEG, 1920, 1080, 12, 1);
+    }
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         printf("использование:\n"
@@ -408,7 +457,9 @@ int main(int argc, char **argv) {
                "  xrprobe --grab <устройство> <файл> [MJPG|HEVC] [ШxВ]\n"
                "  xrprobe --modes <устройство>\n"
                "  xrprobe --sendhid <hidraw> <hex-байты>\n"
-               "  xrprobe --ctrls <устройство>\n");
+               "  xrprobe --ctrls <устройство>\n"
+               "  xrprobe --setctrl <устройство> <id 0x..> <значение>\n"
+               "  xrprobe --focus <устройство>\n");
         return 1;
     }
     if (!strcmp(argv[1], "--info")) cmd_info();
@@ -428,6 +479,9 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[1], "--modes") && argc > 2) cmd_modes(argv[2]);
     else if (!strcmp(argv[1], "--sendhid") && argc > 3) cmd_sendhid(argv[2], argv[3]);
     else if (!strcmp(argv[1], "--ctrls") && argc > 2) cmd_ctrls(argv[2]);
+    else if (!strcmp(argv[1], "--setctrl") && argc > 4)
+        cmd_setctrl(argv[2], (unsigned int)strtoul(argv[3], NULL, 0), atoi(argv[4]));
+    else if (!strcmp(argv[1], "--focus") && argc > 2) cmd_focus(argv[2]);
     else { printf("неизвестная команда\n"); return 1; }
     return 0;
 }
