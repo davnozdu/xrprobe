@@ -190,13 +190,21 @@ static void cmd_v4l2(const char *dev) {
 }
 
 // Захват одного кадра через mmap. Пишет сырые байты в файл.
-static void cmd_grab(const char *dev, const char *out) {
+static void cmd_grab(const char *dev, const char *out, int want_mjpeg) {
     int fd = open(dev, O_RDWR);
     if (fd < 0) { printf("не открыть %s: %s\n", dev, strerror(errno)); return; }
 
     struct v4l2_format f;
     memset(&f, 0, sizeof f);
     f.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (want_mjpeg) {
+        f.fmt.pix.width = 1920;
+        f.fmt.pix.height = 1080;
+        f.fmt.pix.pixelformat = V4L2_PIX_FMT_MJPEG;
+        f.fmt.pix.field = V4L2_FIELD_NONE;
+        if (ioctl(fd, VIDIOC_S_FMT, &f) != 0) printf("S_FMT MJPEG не удался: %s\n", strerror(errno));
+        else printf("формат переключён на MJPEG\n");
+    }
     if (ioctl(fd, VIDIOC_G_FMT, &f) != 0) { printf("G_FMT: %s\n", strerror(errno)); close(fd); return; }
     char b[5];
     printf("текущий формат: %ux%u %s, кадр %u байт\n", f.fmt.pix.width, f.fmt.pix.height,
@@ -225,23 +233,34 @@ static void cmd_grab(const char *dev, const char *out) {
     printf("поток запущен, ждём кадр...\n");
 
     struct v4l2_buffer bf;
-    int got = -1;
-    for (int attempt = 0; attempt < 60; attempt++) {
+    int saved = 0;
+    for (int frame = 0; frame < 40 && !saved; frame++) {
         memset(&bf, 0, sizeof bf);
         bf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE; bf.memory = V4L2_MEMORY_MMAP;
-        if (ioctl(fd, VIDIOC_DQBUF, &bf) == 0) { got = 0; break; }
-        if (errno != EAGAIN) { printf("DQBUF: %s\n", strerror(errno)); break; }
-        usleep(50000);
-    }
-    if (got == 0) {
-        printf("КАДР ПОЛУЧЕН: %u байт (буфер %u)\n", bf.bytesused, bf.index);
-        FILE *o = fopen(out, "wb");
-        if (o) { fwrite(bufs[bf.index], 1, bf.bytesused, o); fclose(o); printf("записан в %s\n", out); }
+        int ok = -1;
+        for (int a = 0; a < 40; a++) {
+            if (ioctl(fd, VIDIOC_DQBUF, &bf) == 0) { ok = 0; break; }
+            if (errno != EAGAIN) { printf("DQBUF: %s\n", strerror(errno)); break; }
+            usleep(25000);
+        }
+        if (ok != 0) break;
         const unsigned char *p = bufs[bf.index];
-        printf("первые 16 байт: ");
-        for (int i = 0; i < 16 && i < (int)bf.bytesused; i++) printf("%02x ", p[i]);
+        printf("  кадр %2d: %7u байт", frame, bf.bytesused);
+        if (bf.bytesused >= 4) printf("  начало: %02x %02x %02x %02x", p[0], p[1], p[2], p[3]);
         printf("\n");
-    } else printf("кадр не пришёл\n");
+        if (bf.bytesused > 2000) {
+            FILE *o = fopen(out, "wb");
+            if (o) {
+                fwrite(p, 1, bf.bytesused, o);
+                fclose(o);
+                printf("СОДЕРЖАТЕЛЬНЫЙ КАДР записан в %s (%u байт)\n", out, bf.bytesused);
+                if (p[0] == 0xff && p[1] == 0xd8) printf("это корректный JPEG (маркер SOI ff d8)\n");
+                saved = 1;
+            }
+        }
+        ioctl(fd, VIDIOC_QBUF, &bf);
+    }
+    if (!saved) printf("содержательных кадров не получено\n");
 
     ioctl(fd, VIDIOC_STREAMOFF, &type);
     for (unsigned i = 0; i < rb.count && i < 8; i++) munmap(bufs[i], lens[i]);
@@ -255,14 +274,14 @@ int main(int argc, char **argv) {
                "  xrprobe --syms <путь к .so>\n"
                "  xrprobe --call <путь к .so>\n"
                "  xrprobe --v4l2 <устройство>\n"
-               "  xrprobe --grab <устройство> <файл>\n");
+               "  xrprobe --grab <устройство> <файл> [mjpeg]\n");
         return 1;
     }
     if (!strcmp(argv[1], "--info")) cmd_info();
     else if (!strcmp(argv[1], "--syms") && argc > 2) cmd_syms(argv[2]);
     else if (!strcmp(argv[1], "--call") && argc > 2) cmd_call(argv[2]);
     else if (!strcmp(argv[1], "--v4l2") && argc > 2) cmd_v4l2(argv[2]);
-    else if (!strcmp(argv[1], "--grab") && argc > 3) cmd_grab(argv[2], argv[3]);
+    else if (!strcmp(argv[1], "--grab") && argc > 3) cmd_grab(argv[2], argv[3], argc > 4);
     else { printf("неизвестная команда\n"); return 1; }
     return 0;
 }
