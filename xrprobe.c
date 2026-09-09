@@ -702,6 +702,44 @@ static void cmd_record(const char *dev, const char *out, int seconds,
     close(fd);
 }
 
+
+/** Ждём появления узла, опрашивая его существование. */
+static int wait_node(const char *path, int max_ms) {
+    for (int t = 0; t < max_ms; t += 50) {
+        if (access(path, F_OK) == 0) return 0;
+        usleep(50000);
+    }
+    return -1;
+}
+
+/**
+ * Активация и съёмка одним процессом.
+ *
+ * Разрыв между командой и началом захвата критичен: камера просыпается
+ * ненадолго, и пока шелл проверял состояние между шагами, окно успевало
+ * закрыться — приходили только пустые кадры. Здесь между 0xd3 и STREAMON
+ * не делается ничего лишнего.
+ */
+static void cmd_shoot(const char *hidraw, const char *vdev, const char *out,
+                      int seconds, unsigned int fmt, int w, int h) {
+    unsigned char data[4] = {0x45, 0x10, 0x01, 0x00};
+    unsigned char frame[64];
+    int n = build_cmd(frame, sizeof frame, 0xd3, data, 4);
+
+    int hfd = open(hidraw, O_RDWR | O_NONBLOCK);
+    if (hfd < 0) { printf("не открыть %s: %s\n", hidraw, strerror(errno)); return; }
+    if (write(hfd, frame, n) < 0) { printf("активация: %s\n", strerror(errno)); close(hfd); return; }
+    close(hfd);
+    printf("команда активации отправлена\n");
+
+    // Устройство переподключается: узел исчезает и появляется заново.
+    usleep(300000);
+    if (wait_node(vdev, 12000) != 0) { printf("%s так и не появился\n", vdev); return; }
+    printf("%s поднялся, начинаем сразу\n", vdev);
+
+    cmd_record(vdev, out, seconds, fmt, w, h);
+}
+
 int main(int argc, char **argv) {
     // Сторож: любая операция с камерой обязана уложиться в 3 минуты.
     // Подвисший ioctl держал бы /dev/video2 занятым, и следующий запуск
@@ -720,7 +758,8 @@ int main(int argc, char **argv) {
                "  xrprobe --setctrl <устройство> <id 0x..> <значение>\n"
                "  xrprobe --focus <устройство>\n"
                "  xrprobe --cmd <hidraw> <код 0x..> [hex-данные]\n"
-               "  xrprobe --record <устройство> <файл> <секунд> [HEVC|MJPG] [ШxВ]\n");
+               "  xrprobe --record <устройство> <файл> <секунд> [HEVC|MJPG] [ШxВ]\n"
+               "  xrprobe --shoot <hidraw> <видеоустройство> <файл> <секунд> [HEVC|MJPG]\n");
         return 1;
     }
     if (!strcmp(argv[1], "--info")) cmd_info();
@@ -743,6 +782,13 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[1], "--setctrl") && argc > 4)
         cmd_setctrl(argv[2], (unsigned int)strtoul(argv[3], NULL, 0), atoi(argv[4]));
     else if (!strcmp(argv[1], "--focus") && argc > 2) cmd_focus(argv[2]);
+    else if (!strcmp(argv[1], "--shoot") && argc > 5) {
+        unsigned int fmt = v4l2_fourcc('H','E','V','C'); int w = 2048, h = 1512;
+        if (argc > 6 && (!strcasecmp(argv[6], "mjpg") || !strcasecmp(argv[6], "mjpeg"))) {
+            fmt = V4L2_PIX_FMT_MJPEG; w = 1920; h = 1080;
+        }
+        cmd_shoot(argv[2], argv[3], argv[4], atoi(argv[5]), fmt, w, h);
+    }
     else if (!strcmp(argv[1], "--record") && argc > 4) {
         unsigned int fmt = v4l2_fourcc('H','E','V','C'); int w = 2048, h = 1512;
         if (argc > 5 && (!strcasecmp(argv[5], "mjpg") || !strcasecmp(argv[5], "mjpeg"))) {
