@@ -12,6 +12,8 @@
 #include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <linux/hidraw.h>
+#include <linux/videodev2.h>
+#include <sys/mman.h>
 
 #define XREAL_VID 0x3318
 #define XREAL_PID 0x0436
@@ -133,17 +135,134 @@ static void cmd_call(const char *so) {
     try_call(so, "int f(const char*, int*)",  3);
 }
 
+
+static const char *fourcc(unsigned int f, char *b) {
+    b[0]=f&0xff; b[1]=(f>>8)&0xff; b[2]=(f>>16)&0xff; b[3]=(f>>24)&0xff; b[4]=0;
+    return b;
+}
+
+static void cmd_v4l2(const char *dev) {
+    int fd = open(dev, O_RDWR);
+    if (fd < 0) { printf("не открыть %s: %s\n", dev, strerror(errno)); return; }
+
+    struct v4l2_capability cap;
+    memset(&cap, 0, sizeof cap);
+    if (ioctl(fd, VIDIOC_QUERYCAP, &cap) == 0) {
+        printf("=== %s ===\n", dev);
+        printf("  драйвер: %s\n  карта:   %s\n  шина:    %s\n", cap.driver, cap.card, cap.bus_info);
+        printf("  возможности: 0x%08x%s\n", cap.capabilities,
+               (cap.capabilities & V4L2_CAP_VIDEO_CAPTURE) ? " (захват видео)" : "");
+    } else { printf("QUERYCAP не удался: %s\n", strerror(errno)); close(fd); return; }
+
+    char b[5];
+    for (int i = 0; i < 16; i++) {
+        struct v4l2_fmtdesc fmt;
+        memset(&fmt, 0, sizeof fmt);
+        fmt.index = i;
+        fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        if (ioctl(fd, VIDIOC_ENUM_FMT, &fmt) != 0) break;
+        printf("  формат %d: %s  (%s)%s\n", i, fourcc(fmt.pixelformat, b), fmt.description,
+               (fmt.flags & V4L2_FMT_FLAG_COMPRESSED) ? " сжатый" : "");
+        for (int j = 0; j < 24; j++) {
+            struct v4l2_frmsizeenum fs;
+            memset(&fs, 0, sizeof fs);
+            fs.index = j;
+            fs.pixel_format = fmt.pixelformat;
+            if (ioctl(fd, VIDIOC_ENUM_FRAMESIZES, &fs) != 0) break;
+            if (fs.type != V4L2_FRMSIZE_TYPE_DISCRETE) break;
+            printf("       %ux%u", fs.discrete.width, fs.discrete.height);
+            for (int k = 0; k < 12; k++) {
+                struct v4l2_frmivalenum fi;
+                memset(&fi, 0, sizeof fi);
+                fi.index = k;
+                fi.pixel_format = fmt.pixelformat;
+                fi.width = fs.discrete.width;
+                fi.height = fs.discrete.height;
+                if (ioctl(fd, VIDIOC_ENUM_FRAMEINTERVALS, &fi) != 0) break;
+                if (fi.type != V4L2_FRMIVAL_TYPE_DISCRETE) break;
+                if (fi.discrete.numerator)
+                    printf("  %.0f fps", (double)fi.discrete.denominator / fi.discrete.numerator);
+            }
+            printf("\n");
+        }
+    }
+    close(fd);
+}
+
+// Захват одного кадра через mmap. Пишет сырые байты в файл.
+static void cmd_grab(const char *dev, const char *out) {
+    int fd = open(dev, O_RDWR);
+    if (fd < 0) { printf("не открыть %s: %s\n", dev, strerror(errno)); return; }
+
+    struct v4l2_format f;
+    memset(&f, 0, sizeof f);
+    f.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (ioctl(fd, VIDIOC_G_FMT, &f) != 0) { printf("G_FMT: %s\n", strerror(errno)); close(fd); return; }
+    char b[5];
+    printf("текущий формат: %ux%u %s, кадр %u байт\n", f.fmt.pix.width, f.fmt.pix.height,
+           fourcc(f.fmt.pix.pixelformat, b), f.fmt.pix.sizeimage);
+
+    struct v4l2_requestbuffers rb;
+    memset(&rb, 0, sizeof rb);
+    rb.count = 4; rb.type = V4L2_BUF_TYPE_VIDEO_CAPTURE; rb.memory = V4L2_MEMORY_MMAP;
+    if (ioctl(fd, VIDIOC_REQBUFS, &rb) != 0) { printf("REQBUFS: %s\n", strerror(errno)); close(fd); return; }
+    printf("буферов выделено: %u\n", rb.count);
+
+    void *bufs[8]; unsigned int lens[8];
+    for (unsigned i = 0; i < rb.count && i < 8; i++) {
+        struct v4l2_buffer bf;
+        memset(&bf, 0, sizeof bf);
+        bf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE; bf.memory = V4L2_MEMORY_MMAP; bf.index = i;
+        if (ioctl(fd, VIDIOC_QUERYBUF, &bf) != 0) { printf("QUERYBUF: %s\n", strerror(errno)); close(fd); return; }
+        bufs[i] = mmap(NULL, bf.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, bf.m.offset);
+        lens[i] = bf.length;
+        if (bufs[i] == MAP_FAILED) { printf("mmap: %s\n", strerror(errno)); close(fd); return; }
+        if (ioctl(fd, VIDIOC_QBUF, &bf) != 0) { printf("QBUF: %s\n", strerror(errno)); close(fd); return; }
+    }
+
+    int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (ioctl(fd, VIDIOC_STREAMON, &type) != 0) { printf("STREAMON: %s\n", strerror(errno)); close(fd); return; }
+    printf("поток запущен, ждём кадр...\n");
+
+    struct v4l2_buffer bf;
+    int got = -1;
+    for (int attempt = 0; attempt < 60; attempt++) {
+        memset(&bf, 0, sizeof bf);
+        bf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE; bf.memory = V4L2_MEMORY_MMAP;
+        if (ioctl(fd, VIDIOC_DQBUF, &bf) == 0) { got = 0; break; }
+        if (errno != EAGAIN) { printf("DQBUF: %s\n", strerror(errno)); break; }
+        usleep(50000);
+    }
+    if (got == 0) {
+        printf("КАДР ПОЛУЧЕН: %u байт (буфер %u)\n", bf.bytesused, bf.index);
+        FILE *o = fopen(out, "wb");
+        if (o) { fwrite(bufs[bf.index], 1, bf.bytesused, o); fclose(o); printf("записан в %s\n", out); }
+        const unsigned char *p = bufs[bf.index];
+        printf("первые 16 байт: ");
+        for (int i = 0; i < 16 && i < (int)bf.bytesused; i++) printf("%02x ", p[i]);
+        printf("\n");
+    } else printf("кадр не пришёл\n");
+
+    ioctl(fd, VIDIOC_STREAMOFF, &type);
+    for (unsigned i = 0; i < rb.count && i < 8; i++) munmap(bufs[i], lens[i]);
+    close(fd);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         printf("использование:\n"
                "  xrprobe --info\n"
                "  xrprobe --syms <путь к .so>\n"
-               "  xrprobe --call <путь к .so>\n");
+               "  xrprobe --call <путь к .so>\n"
+               "  xrprobe --v4l2 <устройство>\n"
+               "  xrprobe --grab <устройство> <файл>\n");
         return 1;
     }
     if (!strcmp(argv[1], "--info")) cmd_info();
     else if (!strcmp(argv[1], "--syms") && argc > 2) cmd_syms(argv[2]);
     else if (!strcmp(argv[1], "--call") && argc > 2) cmd_call(argv[2]);
+    else if (!strcmp(argv[1], "--v4l2") && argc > 2) cmd_v4l2(argv[2]);
+    else if (!strcmp(argv[1], "--grab") && argc > 3) cmd_grab(argv[2], argv[3]);
     else { printf("неизвестная команда\n"); return 1; }
     return 0;
 }
