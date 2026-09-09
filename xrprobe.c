@@ -28,6 +28,8 @@ static const char *NRBSP_SYMS[] = {
     "NRBSPWaitPilotReady",  "NRBSPCheckServiceReady", NULL
 };
 
+static int set_ctrl(int fd, unsigned int id, int value);
+
 static void hexdump(const unsigned char *p, int n) {
     for (int i = 0; i < n; i++) {
         if (i && i % 16 == 0) printf("\n            ");
@@ -198,6 +200,11 @@ static int capture(const char *dev, const char *out, unsigned int want_fmt,
                    int want_w, int want_h, int frames_wanted, int quiet) {
     int fd = open(dev, O_RDWR);
     if (fd < 0) { printf("не открыть %s: %s\n", dev, strerror(errno)); return -1; }
+
+    // Резкость ставится этим же дескриптором. Отдельный вызов открывал бы
+    // устройство заново, а закрытие сбрасывает взведение потока — после него
+    // S_FMT падает с EIO, и кадр уже не получить.
+    set_ctrl(fd, 0x0098091b, 100);
 
     struct v4l2_format f;
     memset(&f, 0, sizeof f);
@@ -606,6 +613,8 @@ static void cmd_record(const char *dev, const char *out, int seconds,
                        unsigned int fmt, int w, int h) {
     int fd = open(dev, O_RDWR);
     if (fd < 0) { printf("не открыть %s: %s\n", dev, strerror(errno)); return; }
+
+    set_ctrl(fd, 0x0098091b, 100);
 
     struct v4l2_format f;
     memset(&f, 0, sizeof f);
