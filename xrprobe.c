@@ -13,6 +13,8 @@
 #include <sys/wait.h>
 #include <linux/hidraw.h>
 #include <linux/videodev2.h>
+#include <signal.h>
+#include <time.h>
 #include <sys/mman.h>
 
 #define XREAL_VID 0x3318
@@ -591,7 +593,93 @@ static void cmd_cmd(const char *dev, unsigned int code, const char *hexdata) {
     close(fd);
 }
 
+
+/**
+ * Запись видео: кадры HEVC складываются подряд в файл Annex-B.
+ *
+ * Камера отдаёт готовый HEVC с VPS/SPS/PPS в потоке, поэтому простая
+ * конкатенация кадров даёт файл, который читают ffmpeg и VLC. Контейнер
+ * MP4 здесь не делается намеренно: в приложении это задача MediaMuxer,
+ * а для проверки железа сырой поток нагляднее.
+ */
+static void cmd_record(const char *dev, const char *out, int seconds,
+                       unsigned int fmt, int w, int h) {
+    int fd = open(dev, O_RDWR);
+    if (fd < 0) { printf("не открыть %s: %s\n", dev, strerror(errno)); return; }
+
+    struct v4l2_format f;
+    memset(&f, 0, sizeof f);
+    f.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    f.fmt.pix.width = w; f.fmt.pix.height = h;
+    f.fmt.pix.pixelformat = fmt;
+    f.fmt.pix.field = V4L2_FIELD_NONE;
+    if (ioctl(fd, VIDIOC_S_FMT, &f) != 0) {
+        printf("S_FMT: %s\n  (поток не взведён — пошлите 0xd3)\n", strerror(errno));
+        close(fd); return;
+    }
+    char b[5];
+    printf("режим: %ux%u %s, пишем %d с\n", f.fmt.pix.width, f.fmt.pix.height,
+           fourcc(f.fmt.pix.pixelformat, b), seconds);
+
+    struct v4l2_requestbuffers rb;
+    memset(&rb, 0, sizeof rb);
+    rb.count = 6; rb.type = V4L2_BUF_TYPE_VIDEO_CAPTURE; rb.memory = V4L2_MEMORY_MMAP;
+    if (ioctl(fd, VIDIOC_REQBUFS, &rb) != 0) { printf("REQBUFS: %s\n", strerror(errno)); close(fd); return; }
+    void *bufs[8]; unsigned int lens[8];
+    for (unsigned i = 0; i < rb.count && i < 8; i++) {
+        struct v4l2_buffer bf;
+        memset(&bf, 0, sizeof bf);
+        bf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE; bf.memory = V4L2_MEMORY_MMAP; bf.index = i;
+        if (ioctl(fd, VIDIOC_QUERYBUF, &bf) != 0) { close(fd); return; }
+        bufs[i] = mmap(NULL, bf.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, bf.m.offset);
+        lens[i] = bf.length;
+        if (bufs[i] == MAP_FAILED) { close(fd); return; }
+        ioctl(fd, VIDIOC_QBUF, &bf);
+    }
+    int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (ioctl(fd, VIDIOC_STREAMON, &type) != 0) { printf("STREAMON: %s\n", strerror(errno)); close(fd); return; }
+
+    FILE *o = fopen(out, "wb");
+    if (!o) { printf("не создать %s: %s\n", out, strerror(errno)); close(fd); return; }
+
+    time_t t0 = time(NULL);
+    unsigned long total = 0; int frames = 0, empty = 0;
+    while (time(NULL) - t0 < seconds) {
+        struct v4l2_buffer bf;
+        memset(&bf, 0, sizeof bf);
+        bf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE; bf.memory = V4L2_MEMORY_MMAP;
+        int ok = -1;
+        for (int a = 0; a < 50; a++) {
+            if (ioctl(fd, VIDIOC_DQBUF, &bf) == 0) { ok = 0; break; }
+            if (errno != EAGAIN) break;
+            usleep(10000);
+        }
+        if (ok != 0) break;
+        if (bf.bytesused > 2000) {
+            fwrite(bufs[bf.index], 1, bf.bytesused, o);
+            total += bf.bytesused; frames++;
+        } else empty++;
+        ioctl(fd, VIDIOC_QBUF, &bf);
+    }
+    fclose(o);
+    int secs = (int)(time(NULL) - t0);
+    if (secs < 1) secs = 1;
+    printf("записано: %d кадров, %lu байт (%.1f МБ), %.1f кадр/с, битрейт %.1f Мбит/с\n",
+           frames, total, total / 1048576.0, (double)frames / secs,
+           total * 8.0 / secs / 1e6);
+    if (empty) printf("пустых кадров пропущено: %d\n", empty);
+    printf("файл: %s\n", out);
+
+    ioctl(fd, VIDIOC_STREAMOFF, &type);
+    for (unsigned i = 0; i < rb.count && i < 8; i++) munmap(bufs[i], lens[i]);
+    close(fd);
+}
+
 int main(int argc, char **argv) {
+    // Сторож: любая операция с камерой обязана уложиться в 3 минуты.
+    // Подвисший ioctl держал бы /dev/video2 занятым, и следующий запуск
+    // падал бы с "Device or resource busy".
+    alarm(180);
     if (argc < 2) {
         printf("использование:\n"
                "  xrprobe --info\n"
@@ -604,7 +692,8 @@ int main(int argc, char **argv) {
                "  xrprobe --ctrls <устройство>\n"
                "  xrprobe --setctrl <устройство> <id 0x..> <значение>\n"
                "  xrprobe --focus <устройство>\n"
-               "  xrprobe --cmd <hidraw> <код 0x..> [hex-данные]\n");
+               "  xrprobe --cmd <hidraw> <код 0x..> [hex-данные]\n"
+               "  xrprobe --record <устройство> <файл> <секунд> [HEVC|MJPG] [ШxВ]\n");
         return 1;
     }
     if (!strcmp(argv[1], "--info")) cmd_info();
@@ -627,6 +716,14 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[1], "--setctrl") && argc > 4)
         cmd_setctrl(argv[2], (unsigned int)strtoul(argv[3], NULL, 0), atoi(argv[4]));
     else if (!strcmp(argv[1], "--focus") && argc > 2) cmd_focus(argv[2]);
+    else if (!strcmp(argv[1], "--record") && argc > 4) {
+        unsigned int fmt = v4l2_fourcc('H','E','V','C'); int w = 2048, h = 1512;
+        if (argc > 5 && (!strcasecmp(argv[5], "mjpg") || !strcasecmp(argv[5], "mjpeg"))) {
+            fmt = V4L2_PIX_FMT_MJPEG; w = 1920; h = 1080;
+        }
+        if (argc > 6) sscanf(argv[6], "%dx%d", &w, &h);
+        cmd_record(argv[2], argv[3], atoi(argv[4]), fmt, w, h);
+    }
     else if (!strcmp(argv[1], "--cmd") && argc > 3)
         cmd_cmd(argv[2], (unsigned int)strtoul(argv[3], NULL, 0), argc > 4 ? argv[4] : NULL);
     else { printf("неизвестная команда\n"); return 1; }
