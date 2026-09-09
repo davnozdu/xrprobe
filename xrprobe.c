@@ -317,6 +317,58 @@ static void cmd_modes(const char *dev) {
     }
 }
 
+
+/**
+ * Отправка сырого HID-репорта в очки и чтение ответа.
+ *
+ * Байты берутся как есть: CRC в кадре XREAL зависит только от содержимого
+ * (одна и та же команда в разных перехватах шла с одинаковой контрольной
+ * суммой), поэтому записанную команду можно воспроизводить дословно,
+ * не зная алгоритма подсчёта.
+ */
+static void cmd_sendhid(const char *dev, const char *hex) {
+    unsigned char buf[1024];
+    int n = 0;
+    for (const char *p = hex; *p && n < (int)sizeof buf; ) {
+        if (*p == ' ' || *p == ':' || *p == ',') { p++; continue; }
+        unsigned int v;
+        if (sscanf(p, "%2x", &v) != 1) { printf("плохой hex у позиции %d\n", (int)(p - hex)); return; }
+        buf[n++] = (unsigned char)v;
+        p += 2;
+    }
+    if (n == 0) { printf("пустая команда\n"); return; }
+
+    printf("отправляю %d байт в %s:\n  ", n, dev);
+    for (int i = 0; i < n; i++) printf("%02x ", buf[i]);
+    printf("\n");
+
+    int fd = open(dev, O_RDWR);
+    if (fd < 0) { printf("не открыть %s: %s\n", dev, strerror(errno)); return; }
+
+    ssize_t w = write(fd, buf, n);
+    if (w < 0) { printf("ошибка записи: %s\n", strerror(errno)); close(fd); return; }
+    printf("записано: %zd байт\n", w);
+
+    // Ответ приходит на interrupt IN. Ждём недолго: очки отвечают быстро,
+    // а после команды активации устройство вообще переподключается.
+    unsigned char in[1024];
+    for (int attempt = 0; attempt < 30; attempt++) {
+        ssize_t r = read(fd, in, sizeof in);
+        if (r > 0) {
+            printf("ответ %zd байт:\n  ", r);
+            for (int i = 0; i < r && i < 32; i++) printf("%02x ", in[i]);
+            printf("\n");
+            break;
+        }
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            printf("чтение прервано: %s\n", strerror(errno));
+            break;
+        }
+        usleep(50000);
+    }
+    close(fd);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         printf("использование:\n"
@@ -325,7 +377,8 @@ int main(int argc, char **argv) {
                "  xrprobe --call <путь к .so>\n"
                "  xrprobe --v4l2 <устройство>\n"
                "  xrprobe --grab <устройство> <файл> [MJPG|HEVC] [ШxВ]\n"
-               "  xrprobe --modes <устройство>\n");
+               "  xrprobe --modes <устройство>\n"
+               "  xrprobe --sendhid <hidraw> <hex-байты>\n");
         return 1;
     }
     if (!strcmp(argv[1], "--info")) cmd_info();
@@ -343,6 +396,7 @@ int main(int argc, char **argv) {
         cmd_grab(argv[2], argv[3], fmt, w, h);
     }
     else if (!strcmp(argv[1], "--modes") && argc > 2) cmd_modes(argv[2]);
+    else if (!strcmp(argv[1], "--sendhid") && argc > 3) cmd_sendhid(argv[2], argv[3]);
     else { printf("неизвестная команда\n"); return 1; }
     return 0;
 }
