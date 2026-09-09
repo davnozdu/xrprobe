@@ -342,7 +342,9 @@ static void cmd_sendhid(const char *dev, const char *hex) {
     for (int i = 0; i < n; i++) printf("%02x ", buf[i]);
     printf("\n");
 
-    int fd = open(dev, O_RDWR);
+    // O_NONBLOCK обязателен: очки отвечают не на всякую команду, а блокирующий
+    // read() в этом случае вис бы навсегда.
+    int fd = open(dev, O_RDWR | O_NONBLOCK);
     if (fd < 0) { printf("не открыть %s: %s\n", dev, strerror(errno)); return; }
 
     ssize_t w = write(fd, buf, n);
@@ -352,12 +354,14 @@ static void cmd_sendhid(const char *dev, const char *hex) {
     // Ответ приходит на interrupt IN. Ждём недолго: очки отвечают быстро,
     // а после команды активации устройство вообще переподключается.
     unsigned char in[1024];
+    int got = 0;
     for (int attempt = 0; attempt < 30; attempt++) {
         ssize_t r = read(fd, in, sizeof in);
         if (r > 0) {
             printf("ответ %zd байт:\n  ", r);
             for (int i = 0; i < r && i < 32; i++) printf("%02x ", in[i]);
             printf("\n");
+            got = 1;
             break;
         }
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
@@ -366,6 +370,7 @@ static void cmd_sendhid(const char *dev, const char *hex) {
         }
         usleep(50000);
     }
+    if (!got) printf("ответа нет (команда могла быть принята без подтверждения)\n");
     close(fd);
 }
 
